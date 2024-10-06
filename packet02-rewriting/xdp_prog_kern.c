@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #include <linux/bpf.h>
 #include <linux/in.h>
+#include <linux/udp.h>
+#include <linux/tcp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -16,30 +18,41 @@
  */
 static __always_inline int vlan_tag_pop(struct xdp_md *ctx, struct ethhdr *eth)
 {
-	/*
 	void *data_end = (void *)(long)ctx->data_end;
 	struct ethhdr eth_cpy;
 	struct vlan_hdr *vlh;
 	__be16 h_proto;
-	*/
 	int vlid = -1;
 
 	/* Check if there is a vlan tag to pop */
+	vlh = (struct vlan_hdr *)(eth + 1);
 
 	/* Still need to do bounds checking */
+	if (vlh + 1 > data_end)
+		return vlid;
 
 	/* Save vlan ID for returning, h_proto for updating Ethernet header */
+	vlid = bpf_ntohs(vlh->h_vlan_TCI);
+	h_proto = vlh->h_vlan_encapsulated_proto;
 
 	/* Make a copy of the outer Ethernet header before we cut it off */
+	__builtin_memcpy(&eth_cpy, eth, sizeof(eth_cpy));
 
 	/* Actually adjust the head pointer */
+	if (bpf_xdp_adjust_head(ctx, sizeof(struct vlan_hdr)))
+		return -1;
 
 	/* Need to re-evaluate data *and* data_end and do new bounds checking
 	 * after adjusting head
 	 */
+	eth = (void *)(long)ctx->data;
+	data_end = (void *)(long)ctx->data_end;
+	if (eth + 1 > data_end)
+		return -1;
 
 	/* Copy back the old Ethernet header and update the proto type */
-
+	__builtin_memcpy(eth, &eth_cpy, sizeof(*eth));
+	eth->h_proto = h_proto;
 
 	return vlid;
 }
@@ -50,6 +63,41 @@ static __always_inline int vlan_tag_pop(struct xdp_md *ctx, struct ethhdr *eth)
 static __always_inline int vlan_tag_push(struct xdp_md *ctx,
 					 struct ethhdr *eth, int vlid)
 {
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ethhdr eth_cpy;
+	struct vlan_hdr *vlh;
+
+	/* Make a copy of the outer Ethernet header before we cut it off */
+	__builtin_memcpy(&eth_cpy, eth, sizeof(eth_cpy));
+
+	/* Actually adjust the head pointer */
+	if (bpf_xdp_adjust_head(ctx, 0- (int) sizeof(struct vlan_hdr)))
+		return -1;
+
+	/* Need to re-evaluate data *and* data_end and do new bounds checking
+	  * after adjusting head
+	  */
+	eth = (void *)(long)ctx->data;
+	data_end = (void *)(long)ctx->data_end;
+
+	if (eth + 1 > data_end)
+		return -1;
+
+	/* Copy back the old Ethernet header and update the proto type */
+	__builtin_memcpy(eth, &eth_cpy, sizeof(*eth));
+	eth->h_proto =  bpf_htons(ETH_P_8021Q);
+
+	/* Check if there is a vlan tag to pop */
+	vlh = (struct vlan_hdr *)(eth + 1);
+
+	/* Still need to do bounds checking */
+	if (vlh + 1 > data_end)
+		return -1;
+
+	/* Save vlan ID for returning, h_proto for updating Ethernet header */
+	vlh->h_vlan_TCI =  bpf_htons(vlid);
+    vlh->h_vlan_encapsulated_proto = eth_cpy.h_proto;
+
 	return 0;
 }
 
@@ -57,7 +105,38 @@ static __always_inline int vlan_tag_push(struct xdp_md *ctx,
 SEC("xdp")
 int xdp_port_rewrite_func(struct xdp_md *ctx)
 {
-	return XDP_PASS;
+	void *data_end = (void *)(long)ctx->data_end;
+	void *data = (void *)(long)ctx->data;
+
+	__u32 action = XDP_PASS; /* Default action */
+
+	/* These keep track of the next header type and iterator pointer */
+	struct hdr_cursor nh;
+	int nh_type, err;
+	nh.pos = data;
+
+	struct ethhdr *eth;
+	nh_type = parse_ethhdr(&nh, data_end, &eth);
+
+	if (nh_type == IPPROTO_UDP) {
+		struct udphdr *udphdr;
+		err = parse_udphdr(&nh, data_end, &udphdr);
+		if (err < 0) {
+			action = XDP_DROP;
+			goto out;
+		}
+		udphdr->dest = bpf_htons(bpf_ntohs(udphdr->dest) - 1);
+	} else if (nh_type == IPPROTO_TCP) {
+		struct tcphdr *tcphdr;
+		err = parse_tcphdr(&nh, data_end, &tcphdr);
+		if (err < 0) {
+			action = XDP_DROP;
+			goto out;
+		}
+		tcphdr->dest = bpf_htons(bpf_ntohs(tcphdr->dest) - 1);
+	}
+out:
+   return xdp_stats_record_action(ctx, action);
 }
 
 /* VLAN swapper; will pop outermost VLAN tag if it exists, otherwise push a new
@@ -68,6 +147,7 @@ int xdp_vlan_swap_func(struct xdp_md *ctx)
 {
 	void *data_end = (void *)(long)ctx->data_end;
 	void *data = (void *)(long)ctx->data;
+
 
 	/* These keep track of the next header type and iterator pointer */
 	struct hdr_cursor nh;
